@@ -161,13 +161,13 @@ def create_graph():
         # masks are either 0 or 1... use embed + voc size of two so that text and mask embs have same size / same impact on the repr
         #mask_e, m_emb = Embedding(mask, 2, emb_dim, random_state=random_state,
         #                          name="mask_emb")
+        random_state = np.random.RandomState(1442)
         conv_text, all_intermediates = SequenceConv1dStack([text_e], [emb_dim], n_filts, bn_flag,
                                         n_stacks=n_stacks,
                                         kernel_sizes=[(1, 1), (3, 3), (5, 5)],
                                         name="enc_conv1", random_state=random_state)
-        print(all_intermediates.keys())
-
         # text_mask and mask_mask should be the same, doesn't matter which one we use
+        random_state = np.random.RandomState(1442)
         bitext = BiLSTMLayer([conv_text], [n_filts],
                              enc_units,
                              input_mask=text_mask,

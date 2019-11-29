@@ -10,8 +10,9 @@ import shutil
 from kkpthlib import Embedding
 from kkpthlib import Linear
 from kkpthlib import SequenceConv1dStack
-#from kkpthlib import LSTMCell
-#from kkpthlib import BiLSTMLayer
+from kkpthlib import LSTMCell
+from kkpthlib import BiLSTMLayer
+
 #from kkpthlib import GaussianAttentionCell
 #from kkpthlib import DiscreteMixtureOfLogistics
 #from kkpthlib import DiscreteMixtureOfLogisticsCost
@@ -116,21 +117,25 @@ out_mels = mels[1:, :, :]
 out_mel_mask = mel_mask[1:]
 prenet_dropout=1.
 
+random_state = np.random.RandomState(1442)
+projmel1_obj = Linear([output_size], prenet_units,
+                      dropout_flag_prob_keep=prenet_dropout, name="prenet1",
+                      random_state=random_state)
+projmel1 = projmel1_obj([in_mels],
+                         dropout_flag_prob_keep=prenet_dropout)
 
 random_state = np.random.RandomState(1442)
-projmel1 = Linear([in_mels], [output_size], prenet_units,
-                  dropout_flag_prob_keep=prenet_dropout, name="prenet1",
-                  random_state=random_state)
-
-random_state = np.random.RandomState(1442)
-projmel2 = Linear([projmel1], [prenet_units], prenet_units,
-                  dropout_flag_prob_keep=prenet_dropout, name="prenet2",
-                  random_state=random_state)
+projmel2_obj = Linear([prenet_units], prenet_units,
+                      dropout_flag_prob_keep=prenet_dropout, name="prenet2",
+                      random_state=random_state)
+projmel2 = projmel2_obj([projmel1],
+                        dropout_flag_prob_keep=prenet_dropout)
 
 
 random_state = np.random.RandomState(1442)
-text_char_e, t_c_emb = Embedding(text, vocabulary_size, emb_dim, random_state=random_state,
+text_emb_obj = Embedding(vocabulary_size, emb_dim, random_state=random_state,
                                  name="text_char_emb")
+text_char_e, t_c_emb = text_emb_obj(text)
 
 #text_phone_e, t_p_emb = Embedding(text, vocabulary_size, emb_dim, random_state=random_state,
 #                                  name="text_phone_emb")
@@ -143,19 +148,26 @@ text_e = text_char_e
 #                          name="mask_emb")
 
 random_state = np.random.RandomState(1442)
-conv_text = SequenceConv1dStack([text_e], [emb_dim], n_filts, bn_flag,
-                                n_stacks=n_stacks,
-                                kernel_sizes=[(1, 1), (3, 3), (5, 5)],
-                                name="enc_conv1", random_state=random_state)
-from IPython import embed; embed(); raise ValueError()
+conv_text_obj = SequenceConv1dStack([emb_dim], n_filts,
+                                    batch_norm_flag=bn_flag,
+                                    n_stacks=n_stacks,
+                                    kernel_sizes=[(1, 1), (3, 3), (5, 5)],
+                                    name="enc_conv1",
+                                    random_state=random_state)
+conv_text = conv_text_obj([text_e])
 
 # text_mask and mask_mask should be the same, doesn't matter which one we use
-bitext = BiLSTMLayer([conv_text], [n_filts],
-                     enc_units,
-                     input_mask=text_mask,
-                     name="encode_bidir",
-                     init=rnn_init,
-                     random_state=random_state)
+random_state = np.random.RandomState(1442)
+bitext_layer_obj = BiLSTMLayer([n_filts],
+                               enc_units,
+                               name="encode_bidir",
+                               init=rnn_init,
+                               random_state=random_state)
+bitext = bitext_layer_obj([conv_text],
+                          input_mask=text_mask)
+print("bilstm conv")
+from IPython import embed; embed(); raise ValueError()
+from IPython import embed; embed(); raise ValueError()
 
 
 def create_graph():
