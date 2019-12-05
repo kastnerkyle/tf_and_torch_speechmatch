@@ -12,8 +12,9 @@ from kkpthlib import Linear
 from kkpthlib import SequenceConv1dStack
 from kkpthlib import LSTMCell
 from kkpthlib import BiLSTMLayer
+from kkpthlib import GaussianAttentionCell
+from kkpthlib import scan
 
-#from kkpthlib import GaussianAttentionCell
 #from kkpthlib import DiscreteMixtureOfLogistics
 #from kkpthlib import DiscreteMixtureOfLogisticsCost
 #from kkpthlib import AdditiveGaussianNoise
@@ -23,6 +24,7 @@ seq_len = 48
 batch_size = 10
 window_mixtures = 10
 cell_dropout = .925
+cell_dropout = 1.
 #noise_scale = 8.
 prenet_units = 128
 n_filts = 128
@@ -111,6 +113,15 @@ text_mask = torch.FloatTensor(text_mask)
 mels = torch.FloatTensor(mels)
 mel_mask = torch.FloatTensor(mel_mask)
 
+att_w_init = torch.FloatTensor(np.zeros((batch_size, 2 * enc_units)))
+att_k_init = torch.FloatTensor(np.zeros((batch_size, window_mixtures)))
+att_h_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+att_c_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+h1_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+c1_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+h2_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+c2_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
+
 in_mels = mels[:-1, :, :]
 in_mel_mask = mel_mask[:-1]
 out_mels = mels[1:, :, :]
@@ -165,8 +176,85 @@ bitext_layer_obj = BiLSTMLayer([n_filts],
                                random_state=random_state)
 bitext = bitext_layer_obj([conv_text],
                           input_mask=text_mask)
-print("bilstm conv")
-from IPython import embed; embed(); raise ValueError()
+
+random_state = np.random.RandomState(1442)
+attn_obj = GaussianAttentionCell([prenet_units],
+                                 2 * enc_units,
+                                 dec_units,
+                                 attention_scale=1.,
+                                 step_op="softplus",
+                                 name="att",
+                                 random_state=random_state,
+                                 init=rnn_init)
+
+random_state = np.random.RandomState(1442)
+rnn1_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
+                    dec_units,
+                    random_state=random_state,
+                    name="rnn1", init=rnn_init)
+
+random_state = np.random.RandomState(1442)
+rnn2_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
+                    dec_units,
+                    random_state=random_state,
+                    name="rnn2", init=rnn_init)
+
+def step(inp_t, inp_mask_t,
+         corr_inp_t,
+         att_w_tm1, att_k_tm1, att_h_tm1, att_c_tm1,
+         h1_tm1, c1_tm1, h2_tm1, c2_tm1):
+
+    o = attn_obj([corr_inp_t],
+                 (att_h_tm1, att_c_tm1),
+                 att_k_tm1,
+                 bitext,
+                 att_w_tm1,
+                 input_mask=inp_mask_t,
+                 conditioning_mask=text_mask,
+                 #attention_scale=1. / 10.,
+                 cell_dropout=1.)
+    att_w_t, att_k_t, att_phi_t, s = o
+    att_h_t = s[0]
+    att_c_t = s[1]
+
+    output, s = rnn1_obj([corr_inp_t, att_w_t, att_h_t],
+                         h1_tm1, c1_tm1,
+                         input_mask=inp_mask_t,
+                         cell_dropout=cell_dropout)
+    h1_t = s[0]
+    c1_t = s[1]
+    output, s = rnn2_obj([corr_inp_t, att_w_t, h1_t],
+                         h2_tm1, c2_tm1,
+                         input_mask=inp_mask_t,
+                         cell_dropout=cell_dropout)
+    h2_t = s[0]
+    c2_t = s[1]
+    return output, att_w_t, att_k_t, att_phi_t, att_h_t, att_c_t, h1_t, c1_t, h2_t, c2_t
+
+r = scan(step,
+         [in_mels, in_mel_mask, projmel2],
+         [None, att_w_init, att_k_init, None, att_h_init, att_c_init,
+         h1_init, c1_init, h2_init, c2_init])
+
+# values are close-ish to tf but floating point variances accumulate
+output = r[0]
+att_w = r[1]
+att_k = r[2]
+att_phi = r[3]
+att_h = r[4]
+att_c = r[5]
+h1 = r[6]
+c1 = r[7]
+h2 = r[8]
+c2 = r[9]
+
+random_state = np.random.RandomState(1442)
+pred_obj = Linear([dec_units], output_size,
+                  name="out_proj",
+                  random_state=random_state)
+pred = pred_obj([output])
+cc = torch.pow(pred - out_mels, 2)
+loss = cc.sum(dim=-1).mean()
 from IPython import embed; embed(); raise ValueError()
 
 

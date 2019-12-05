@@ -27,6 +27,7 @@ seq_len = 48
 batch_size = 10
 window_mixtures = 10
 cell_dropout = .925
+cell_dropout = 1.
 #noise_scale = 8.
 prenet_units = 128
 n_filts = 128
@@ -162,18 +163,18 @@ def create_graph():
         #mask_e, m_emb = Embedding(mask, 2, emb_dim, random_state=random_state,
         #                          name="mask_emb")
         random_state = np.random.RandomState(1442)
-        conv_text, all_intermediates = SequenceConv1dStack([text_e], [emb_dim], n_filts, bn_flag,
+        conv_text, conv_intermediates = SequenceConv1dStack([text_e], [emb_dim], n_filts, bn_flag,
                                         n_stacks=n_stacks,
                                         kernel_sizes=[(1, 1), (3, 3), (5, 5)],
                                         name="enc_conv1", random_state=random_state)
         # text_mask and mask_mask should be the same, doesn't matter which one we use
         random_state = np.random.RandomState(1442)
-        bitext = BiLSTMLayer([conv_text], [n_filts],
-                             enc_units,
-                             input_mask=text_mask,
-                             name="encode_bidir",
-                             init=rnn_init,
-                             random_state=random_state)
+        bitext, bilstm_intermediates = BiLSTMLayer([conv_text], [n_filts],
+                                                   enc_units,
+                                                   input_mask=text_mask,
+                                                   name="encode_bidir",
+                                                   init=rnn_init,
+                                                   random_state=random_state)
 
 
         def step(inp_t, inp_mask_t,
@@ -181,6 +182,7 @@ def create_graph():
                  att_w_tm1, att_k_tm1, att_h_tm1, att_c_tm1,
                  h1_tm1, c1_tm1, h2_tm1, c2_tm1):
 
+            random_state = np.random.RandomState(1442)
             o = GaussianAttentionCell([corr_inp_t], [prenet_units],
                                       (att_h_tm1, att_c_tm1),
                                       att_k_tm1,
@@ -201,6 +203,7 @@ def create_graph():
             att_h_t = s[0]
             att_c_t = s[1]
 
+            random_state = np.random.RandomState(1442)
             output, s = LSTMCell([corr_inp_t, att_w_t, att_h_t],
                                  [prenet_units, 2 * enc_units, dec_units],
                                  h1_tm1, c1_tm1, dec_units,
@@ -211,6 +214,7 @@ def create_graph():
             h1_t = s[0]
             c1_t = s[1]
 
+            random_state = np.random.RandomState(1442)
             output, s = LSTMCell([corr_inp_t, att_w_t, h1_t],
                                  [prenet_units, 2 * enc_units, dec_units],
                                  h2_tm1, c2_tm1, dec_units,
@@ -237,6 +241,7 @@ def create_graph():
         h2 = r[8]
         c2 = r[9]
 
+        random_state = np.random.RandomState(1442)
         pred = Linear([output], [dec_units], output_size, name="out_proj", random_state=random_state)
         """
         mix, means, lins = DiscreteMixtureOfLogistics([proj], [output_size], n_output_channels=1,
@@ -308,8 +313,10 @@ def create_graph():
                     "train_step",
                     "learning_rate"]
     things_tf = [eval(name) for name in things_names]
-    things_names = things_names + [k for k in sorted(all_intermediates.keys())]
-    things_tf = things_tf + [all_intermediates[k] for k in sorted(all_intermediates.keys())]
+    things_names = things_names + [k for k in sorted(conv_intermediates.keys())]
+    things_tf = things_tf + [conv_intermediates[k] for k in sorted(conv_intermediates.keys())]
+    things_names = things_names + [k for k in sorted(bilstm_intermediates.keys())]
+    things_tf = things_tf + [bilstm_intermediates[k] for k in sorted(bilstm_intermediates.keys())]
     for tn, tt in zip(things_names, things_tf):
         graph.add_to_collection(tn, tt)
     train_model = namedtuple('Model', things_names)(*things_tf)
@@ -438,7 +445,13 @@ def loop(sess, itr, extras, stateful_args):
             vs.seqconv1d_enc_conv1_conv_2_1,
             vs.seqconv1d_enc_conv1_pre,
             vs.seqconv1d_enc_conv1_conv_1_res,
-            vs.seqconv1d_enc_conv1_conv_1_bn]
+            vs.seqconv1d_enc_conv1_conv_1_bn,
+
+            vs.bilstm_in_proj,
+            vs.bilstm_fwd_hidden,
+            vs.bilstm_fwd_cell,
+            vs.bilstm_rev_hidden,
+            vs.bilstm_rev_cell]
 
     r = sess.run(outs, feed_dict=feed)
 
@@ -494,7 +507,22 @@ def loop(sess, itr, extras, stateful_args):
     seqconv1d_enc_conv1_conv_1_res_np = r[46]
     seqconv1d_enc_conv1_conv_1_bn_np = r[47]
 
+    bilstm_in_proj_np = r[48]
+    bilstm_fwd_hidden_np = r[49]
+    bilstm_fwd_cell_np = r[50]
+    bilstm_rev_hidden_np = r[51]
+    bilstm_rev_cell_np = r[52]
+
     # set next inits
+    att_w_init_old = att_w_init
+    att_k_init_old = att_k_init
+    att_h_init_old = att_h_init
+    att_c_init_old = att_c_init
+    h1_init_old = h1_init
+    c1_init_old = c1_init
+    h2_init_old = h2_init
+    c2_init_old = c2_init
+
     att_w_init = att_w_np[-1]
     att_k_init = att_k_np[-1]
     att_h_init = att_h_np[-1]
@@ -520,6 +548,7 @@ def loop(sess, itr, extras, stateful_args):
              "bitext": bitext_np,
              "pred": pred_np,
              "cc": cc_np,
+             "loss": l,
              "in_mels": in_mels_np,
              "in_mel_mask": in_mel_mask_np,
              "out_mels": out_mels_np,
@@ -549,13 +578,37 @@ def loop(sess, itr, extras, stateful_args):
             "seqconv1d_enc_conv1_conv_2_1": seqconv1d_enc_conv1_conv_2_1_np,
             "seqconv1d_enc_conv1_pre": seqconv1d_enc_conv1_pre_np,
             "seqconv1d_enc_conv1_conv_1_res": seqconv1d_enc_conv1_conv_1_res_np,
-            "seqconv1d_enc_conv1_conv_1_bn": seqconv1d_enc_conv1_conv_1_bn_np}
+            "seqconv1d_enc_conv1_conv_1_bn": seqconv1d_enc_conv1_conv_1_bn_np,
+            "bilstm_in_proj": bilstm_in_proj_np,
+            "bilstm_fwd_hidden": bilstm_fwd_hidden_np,
+            "bilstm_fwd_cell": bilstm_fwd_cell_np,
+            "bilstm_rev_hidden": bilstm_rev_hidden_np,
+            "bilstm_rev_cell": bilstm_rev_cell_np,
+            "att_w_init": att_w_init_old,
+            "att_k_init": att_k_init_old,
+            "att_h_init": att_h_init_old,
+            "att_c_init": att_c_init_old,
+            "h1_init": h1_init_old,
+            "c1_init": c1_init_old,
+            "h2_init": h2_init_old,
+            "c2_init": c2_init_old,
+            "att_w": att_w_np,
+            "att_k": att_k_np,
+            "att_h": att_h_np,
+            "att_c": att_c_np,
+            "h1": h1_np,
+            "c1": c1_np,
+            "h2": h2_np,
+            "c2": c2_np,
+            "att_phi": att_phi_np,
+            }
     return l, None, stateful_args, check
 
 with tf.Session(graph=g) as sess:
     sess.run(tf.global_variables_initializer())
     rr = loop(sess, train_itr, {}, stateful_args)
     np.savez("saved_tf.npz", **rr[-1])
+    print("saved activations to 'saved_tf.npz'")
     #run_loop(sess,
     #         loop, train_itr,
     #         loop, train_itr,

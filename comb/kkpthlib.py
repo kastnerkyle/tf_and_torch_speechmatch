@@ -444,7 +444,7 @@ def scan(fn, sequences, outputs_info):
         inf_ret = fn(*sliced)
         _scan_infos[lu] = inf_ret
     else:
-        inf_ret = scan_infos[lu]
+        inf_ret = _scan_infos[lu]
     if len(outputs_info) < len(inf_ret):
         raise ValueError("More outputs from `fn` than elements in outputs_info. Expected {} outs, given outputs_info of length {}, but `fn` returns {}. Pass None in outputs_info for returns which don't accumulate".format(len(outputs_info), len(outputs_info), len(inf_ret)))
     initializers = []
@@ -1527,13 +1527,11 @@ class LSTMCell(torch.nn.Module):
 
         lstm_proj = self.lstm_proj_obj(list_of_inputs + [ph])
 
-        i = lstm_proj[..., :num_units]
-        j = lstm_proj[..., num_units:2 * num_units]
-        f = lstm_proj[..., 2 * num_units:3 * num_units]
-        o = lstm_proj[..., 3 * num_units:]
+        i, j, f, o = torch.split(lstm_proj, num_units, dim=-1)
+
 
         if cell_dropout is not None:
-            pj = torch.nn.functional.dropout(tanh(j), cell_dropout)
+            pj = torch.nn.functional.dropout(tanh(j), 1. - cell_dropout)
         else:
             pj = tanh(j)
 
@@ -1543,7 +1541,11 @@ class LSTMCell(torch.nn.Module):
 
         h = sigmoid(o) * tanh(c)
         if input_mask is not None:
-            h = input_mask[:, None] * h + (1. - input_mask[:, None]) * h
+            # this line was bugged in released / trained version!
+            # https://github.com/kastnerkyle/representation_mixing/blob/master/code/lib/tfbldr/nodes/nodes.py#L1554
+            # fixed here but will mean things are different
+            # when masks are used
+            h = input_mask[:, None] * h + (1. - input_mask[:, None]) * ph
 
         if output_dim is not None:
             h_to_out = self.h_to_out_obj([h])
@@ -1565,6 +1567,8 @@ def LSTMCell(list_of_inputs, list_of_input_dims,
              cell_dropout=None,
              strict=None):
     # cell_dropout should be a value in [0., 1.], or None
+    # high value - high prob to keep
+    # low value - low prob to keep
     # output is the thing to use in following layers, state is a tuple that feeds into the next call
     if random_state is None:
         raise ValueError("Must pass random_state")
@@ -1616,14 +1620,13 @@ def LSTMCell(list_of_inputs, list_of_input_dims,
                        name=name_proj,
                        init=(comb_w_np, comb_b_np), strict=strict)
 
-    from IPython import embed; embed(); raise ValueError()
     i = lstm_proj[..., :num_units]
     j = lstm_proj[..., num_units:2 * num_units]
     f = lstm_proj[..., 2 * num_units:3 * num_units]
     o = lstm_proj[..., 3 * num_units:]
 
     if cell_dropout is not None:
-        pj = torch.nn.functional.dropout(tanh(j), cell_dropout)
+        pj = torch.nn.functional.dropout(tanh(j), 1. - cell_dropout)
     else:
         pj = tanh(j)
 
@@ -1819,7 +1822,138 @@ class BiLSTMLayer(torch.nn.Module):
             c1_b_t = s[1]
             return h1_f_t, c1_f_t, h1_b_t, c1_b_t
 
+        # should this be a "proper" flip with mask on the end
         r = scan(step,
                  [in_proj, input_mask, torch.flip(in_proj, (0,)), torch.flip(input_mask, (0,))],
                  [h1_f_init, c1_f_init, h1_b_init, c1_b_init])
         return torch.cat([r[0], torch.flip(r[2], (0,))], dim=-1)
+
+
+class GaussianAttentionCell(torch.nn.Module):
+    def __init__(self, list_of_step_input_dims,
+                 full_conditioning_tensor_dim,
+                 num_units,
+                 att_dim=10,
+                 attention_scale=1.,
+                 step_op="exp",
+                 cell_type="lstm",
+                 name=None,
+                 random_state=None,
+                 strict=None, init=None):
+        super(GaussianAttentionCell, self).__init__()
+        #returns w_t, k_t, phi_t, state
+        # where state is the state tuple returned by the inner cell_type
+
+        if name is None:
+            name = _get_name()
+        name = name + "_gaussian_attention"
+
+        #check = any([len(_shape(si)) != 2 for si in list_of_step_inputs])
+        #if check:
+        #    raise ValueError("Unable to support step_input with n_dims != 2")
+
+        if init is None or init == "truncated_normal":
+            rnn_init = "truncated_normal"
+            forward_init = "truncated_normal"
+        else:
+            raise ValueError("init != None not supported")
+
+        random_state = np.random.RandomState(1442)
+        if cell_type == "gru":
+            raise ValueError("NYI")
+        elif cell_type == "lstm":
+            self.attn_rnn_cell = LSTMCell(list_of_step_input_dims + [full_conditioning_tensor_dim],
+                                          num_units,
+                                          random_state=random_state,
+                                          name=name + "_gauss_att_lstm",
+                                          init=rnn_init)
+        else:
+            raise ValueError("Unsupported cell_type %s" % cell_type)
+
+        random_state = np.random.RandomState(1442)
+        self.ret_obj = Linear(
+            list_of_input_dims=[num_units],
+            output_dim=3 * att_dim, name=name + "_group",
+            random_state=random_state,
+            strict=strict, init=forward_init)
+        self.att_dim = att_dim
+        self.full_conditioning_tensor_dim = full_conditioning_tensor_dim
+        self.step_op = step_op
+        self.attention_scale = attention_scale
+
+    def forward(self,
+                list_of_step_inputs,
+                previous_state_list,
+                previous_attention_position,
+                full_conditioning_tensor,
+                previous_attention_weight,
+                input_mask=None,
+                conditioning_mask=None,
+                cell_dropout=None):
+
+        att_dim = self.att_dim
+        full_conditioning_tensor_dim = self.full_conditioning_tensor_dim
+        step_op = self.step_op
+        attention_scale = self.attention_scale
+
+        attn_rnn_out, state = self.attn_rnn_cell(list_of_step_inputs + [previous_attention_weight],
+                                                 previous_state_list[0],
+                                                 previous_state_list[1],
+                                                 input_mask=input_mask,
+                                                 cell_dropout=cell_dropout)
+
+        ret = self.ret_obj([attn_rnn_out])
+        a_t = ret[:, :att_dim]
+        b_t = ret[:, att_dim:2 * att_dim]
+        k_t = ret[:, 2 * att_dim:]
+
+        k_tm1 = previous_attention_position
+        cond_dim = full_conditioning_tensor_dim
+        ctx = full_conditioning_tensor
+        ctx_mask = conditioning_mask
+
+        """
+        ctx = Linear(
+            list_of_inputs=[full_conditioning_tensor],
+            list_of_input_dims=[full_conditioning_tensor_dim],
+            output_dim=next_proj_dim, name=name + "_proj_ctx",
+            weight_norm=weight_norm,
+            random_state=random_state,
+            strict=strict, init=ctx_forward_init)
+        """
+        if step_op == "exp":
+            a_t = torch.exp(a_t)
+            b_t = torch.exp(b_t)
+            step_size = attention_scale * torch.exp(k_t)
+            k_t = k_tm1 + step_size
+        elif step_op == "softplus":
+            a_t = torch.exp(a_t)
+            b_t = torch.exp(b_t)
+            step_size = attention_scale * torch.nn.functional.softplus(k_t)
+            k_t = k_tm1 + step_size
+        elif step_op == "relu":
+            a_t = torch.exp(a_t)
+            b_t = torch.exp(b_t)
+            step_size = attention_scale * relu(k_t)
+            k_t = k_tm1 + step_size
+        else:
+            raise ValueError("{} not a known step_op".format(step_op))
+        u = torch.arange(0, full_conditioning_tensor.shape[0], dtype=torch.float32)
+        u = u[None, None]
+
+        def calc_phi(lk_t, la_t, lb_t, lu):
+            phi = torch.exp(-torch.pow(lk_t[..., None] - lu, 2) * lb_t[..., None]) * la_t[..., None]
+            phi = torch.sum(phi, dim=1)[:, None]
+            return phi
+
+        phi_t = calc_phi(k_t, a_t, b_t, u)
+        if conditioning_mask is not None:
+            w_t_pre = phi_t * ctx.permute(1, 2, 0)
+            w_t_masked = w_t_pre * ctx_mask.permute(1, 0)[:, None]
+            w_t = torch.sum(w_t_masked, dim=-1)[:, None]
+        else:
+            raise ValueError("Non-masked conditional context NYI")
+            w_t = tf.matmul(phi_t, tf.transpose(ctx, (1, 0, 2)))
+        phi_t = phi_t[:, 0]
+        w_t = w_t[:, 0]
+        return w_t, k_t, phi_t, state
