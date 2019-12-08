@@ -255,8 +255,8 @@ def create_graph():
         #loss = tf.reduce_sum(tf.reduce_sum(cc, axis=-1)) / tf.reduce_sum(out_mel_mask)
         loss = tf.reduce_mean(tf.reduce_sum(cc, axis=-1))
 
-        #learning_rate = 0.0001
-        learning_rate = 0.000
+        learning_rate = 0.0001
+        #learning_rate = 0.000
         #steps = tf.Variable(0.)
         #learning_rate = tf.train.exponential_decay(0.001, steps, staircase=True,
         #                                           decay_steps=50000, decay_rate=0.5)
@@ -607,8 +607,10 @@ def loop(sess, itr, extras, stateful_args):
 with tf.Session(graph=g) as sess:
     sess.run(tf.global_variables_initializer())
     rr = loop(sess, train_itr, {}, stateful_args)
-    np.savez("saved_tf.npz", **rr[-1])
-    print("saved activations to 'saved_tf.npz'")
+    np.savez("saved_tf_0.npz", **rr[-1])
+    rr = loop(sess, train_itr, {}, stateful_args)
+    np.savez("saved_tf_1.npz", **rr[-1])
+    print("saved activations to 'saved_tf_*.npz'")
     #run_loop(sess,
     #         loop, train_itr,
     #         loop, train_itr,

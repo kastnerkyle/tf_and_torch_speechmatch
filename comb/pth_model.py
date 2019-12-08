@@ -14,6 +14,7 @@ from kkpthlib import LSTMCell
 from kkpthlib import BiLSTMLayer
 from kkpthlib import GaussianAttentionCell
 from kkpthlib import scan
+from kkpthlib import clipping_grad_norm_
 
 #from kkpthlib import DiscreteMixtureOfLogistics
 #from kkpthlib import DiscreteMixtureOfLogisticsCost
@@ -106,12 +107,7 @@ random_state = np.random.RandomState(1442)
 vocabulary_size = max(train_itr.vocabulary_sizes)
 output_size = train_itr.n_mel_filters
 prenet_dropout = 0.5
-
-mels, mel_mask, text, text_mask, mask, mask_mask, reset = train_itr.next_masked_batch()
-text = torch.FloatTensor(text)
-text_mask = torch.FloatTensor(text_mask)
-mels = torch.FloatTensor(mels)
-mel_mask = torch.FloatTensor(mel_mask)
+prenet_dropout= 1.
 
 att_w_init = torch.FloatTensor(np.zeros((batch_size, 2 * enc_units)))
 att_k_init = torch.FloatTensor(np.zeros((batch_size, window_mixtures)))
@@ -122,205 +118,79 @@ c1_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
 h2_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
 c2_init = torch.FloatTensor(np.zeros((batch_size, dec_units)))
 
-in_mels = mels[:-1, :, :]
-in_mel_mask = mel_mask[:-1]
-out_mels = mels[1:, :, :]
-out_mel_mask = mel_mask[1:]
-prenet_dropout=1.
+class GlobalModel(torch.nn.Module):
+    def __init__(self):
+        super(GlobalModel, self).__init__()
+        random_state = np.random.RandomState(1442)
+        self.projmel1_obj = Linear([output_size], prenet_units,
+                              dropout_flag_prob_keep=prenet_dropout, name="prenet1",
+                              random_state=random_state)
 
-random_state = np.random.RandomState(1442)
-projmel1_obj = Linear([output_size], prenet_units,
-                      dropout_flag_prob_keep=prenet_dropout, name="prenet1",
-                      random_state=random_state)
-projmel1 = projmel1_obj([in_mels],
-                         dropout_flag_prob_keep=prenet_dropout)
-
-random_state = np.random.RandomState(1442)
-projmel2_obj = Linear([prenet_units], prenet_units,
-                      dropout_flag_prob_keep=prenet_dropout, name="prenet2",
-                      random_state=random_state)
-projmel2 = projmel2_obj([projmel1],
-                        dropout_flag_prob_keep=prenet_dropout)
+        random_state = np.random.RandomState(1442)
+        self.projmel2_obj = Linear([prenet_units], prenet_units,
+                              dropout_flag_prob_keep=prenet_dropout, name="prenet2",
+                              random_state=random_state)
 
 
-random_state = np.random.RandomState(1442)
-text_emb_obj = Embedding(vocabulary_size, emb_dim, random_state=random_state,
-                                 name="text_char_emb")
-text_char_e, t_c_emb = text_emb_obj(text)
-
-#text_phone_e, t_p_emb = Embedding(text, vocabulary_size, emb_dim, random_state=random_state,
-#                                  name="text_phone_emb")
-
-#text_e = (1. - mask) * text_char_e + mask * text_phone_e
-text_e = text_char_e
-
-# masks are either 0 or 1... use embed + voc size of two so that text and mask embs have same size / same impact on the repr
-#mask_e, m_emb = Embedding(mask, 2, emb_dim, random_state=random_state,
-#                          name="mask_emb")
-
-random_state = np.random.RandomState(1442)
-conv_text_obj = SequenceConv1dStack([emb_dim], n_filts,
-                                    batch_norm_flag=bn_flag,
-                                    n_stacks=n_stacks,
-                                    kernel_sizes=[(1, 1), (3, 3), (5, 5)],
-                                    name="enc_conv1",
-                                    random_state=random_state)
-conv_text = conv_text_obj([text_e])
-
-# text_mask and mask_mask should be the same, doesn't matter which one we use
-random_state = np.random.RandomState(1442)
-bitext_layer_obj = BiLSTMLayer([n_filts],
-                               enc_units,
-                               name="encode_bidir",
-                               init=rnn_init,
-                               random_state=random_state)
-bitext = bitext_layer_obj([conv_text],
-                          input_mask=text_mask)
-
-random_state = np.random.RandomState(1442)
-attn_obj = GaussianAttentionCell([prenet_units],
-                                 2 * enc_units,
-                                 dec_units,
-                                 attention_scale=1.,
-                                 step_op="softplus",
-                                 name="att",
-                                 random_state=random_state,
-                                 init=rnn_init)
-
-random_state = np.random.RandomState(1442)
-rnn1_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
-                    dec_units,
-                    random_state=random_state,
-                    name="rnn1", init=rnn_init)
-
-random_state = np.random.RandomState(1442)
-rnn2_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
-                    dec_units,
-                    random_state=random_state,
-                    name="rnn2", init=rnn_init)
-
-def step(inp_t, inp_mask_t,
-         corr_inp_t,
-         att_w_tm1, att_k_tm1, att_h_tm1, att_c_tm1,
-         h1_tm1, c1_tm1, h2_tm1, c2_tm1):
-
-    o = attn_obj([corr_inp_t],
-                 (att_h_tm1, att_c_tm1),
-                 att_k_tm1,
-                 bitext,
-                 att_w_tm1,
-                 input_mask=inp_mask_t,
-                 conditioning_mask=text_mask,
-                 #attention_scale=1. / 10.,
-                 cell_dropout=1.)
-    att_w_t, att_k_t, att_phi_t, s = o
-    att_h_t = s[0]
-    att_c_t = s[1]
-
-    output, s = rnn1_obj([corr_inp_t, att_w_t, att_h_t],
-                         h1_tm1, c1_tm1,
-                         input_mask=inp_mask_t,
-                         cell_dropout=cell_dropout)
-    h1_t = s[0]
-    c1_t = s[1]
-    output, s = rnn2_obj([corr_inp_t, att_w_t, h1_t],
-                         h2_tm1, c2_tm1,
-                         input_mask=inp_mask_t,
-                         cell_dropout=cell_dropout)
-    h2_t = s[0]
-    c2_t = s[1]
-    return output, att_w_t, att_k_t, att_phi_t, att_h_t, att_c_t, h1_t, c1_t, h2_t, c2_t
-
-r = scan(step,
-         [in_mels, in_mel_mask, projmel2],
-         [None, att_w_init, att_k_init, None, att_h_init, att_c_init,
-         h1_init, c1_init, h2_init, c2_init])
-
-# values are close-ish to tf but floating point variances accumulate
-output = r[0]
-att_w = r[1]
-att_k = r[2]
-att_phi = r[3]
-att_h = r[4]
-att_c = r[5]
-h1 = r[6]
-c1 = r[7]
-h2 = r[8]
-c2 = r[9]
-
-random_state = np.random.RandomState(1442)
-pred_obj = Linear([dec_units], output_size,
-                  name="out_proj",
-                  random_state=random_state)
-pred = pred_obj([output])
-cc = torch.pow(pred - out_mels, 2)
-loss = cc.sum(dim=-1).mean()
-from IPython import embed; embed(); raise ValueError()
-
-
-def create_graph():
-    graph = tf.Graph()
-    with graph.as_default():
-        tf.set_random_seed(2899)
-
-        text = tf.placeholder(tf.float32, shape=[None, batch_size, 1])
-        text_mask = tf.placeholder(tf.float32, shape=[None, batch_size])
-
-        #mask = tf.placeholder(tf.float32, shape=[None, batch_size, 1])
-        #mask_mask = tf.placeholder(tf.float32, shape=[None, batch_size])
-
-        mels = tf.placeholder(tf.float32, shape=[None, batch_size, output_size])
-        mel_mask = tf.placeholder(tf.float32, shape=[None, batch_size])
-
-        bias = tf.placeholder_with_default(tf.zeros(shape=[]), shape=[])
-        cell_dropout = tf.placeholder_with_default(cell_dropout_scale * tf.ones(shape=[]), shape=[])
-        prenet_dropout = tf.placeholder_with_default(0.5 * tf.ones(shape=[]), shape=[])
-        bn_flag = tf.placeholder_with_default(tf.zeros(shape=[]), shape=[])
-
-        att_w_init = tf.placeholder(tf.float32, shape=[batch_size, 2 * enc_units])
-        att_k_init = tf.placeholder(tf.float32, shape=[batch_size, window_mixtures])
-        att_h_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-        att_c_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-        h1_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-        c1_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-        h2_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-        c2_init = tf.placeholder(tf.float32, shape=[batch_size, dec_units])
-
-        in_mels = mels[:-1, :, :]
-        in_mel_mask = mel_mask[:-1]
-        out_mels = mels[1:, :, :]
-        out_mel_mask = mel_mask[1:]
-
-        projmel1 = Linear([in_mels], [output_size], prenet_units,
-                          dropout_flag_prob_keep=prenet_dropout, name="prenet1",
-                          random_state=random_state)
-        projmel2 = Linear([projmel1], [prenet_units], prenet_units,
-                          dropout_flag_prob_keep=prenet_dropout, name="prenet2",
-                          random_state=random_state)
-
-        text_char_e, t_c_emb = Embedding(text, vocabulary_size, emb_dim, random_state=random_state,
+        random_state = np.random.RandomState(1442)
+        self.text_emb_obj = Embedding(vocabulary_size, emb_dim, random_state=random_state,
                                          name="text_char_emb")
-        #text_phone_e, t_p_emb = Embedding(text, vocabulary_size, emb_dim, random_state=random_state,
-        #                                  name="text_phone_emb")
 
-        #text_e = (1. - mask) * text_char_e + mask * text_phone_e
-        text_e = text_char_e
-
-        # masks are either 0 or 1... use embed + voc size of two so that text and mask embs have same size / same impact on the repr
-        #mask_e, m_emb = Embedding(mask, 2, emb_dim, random_state=random_state,
-        #                          name="mask_emb")
-        conv_text = SequenceConv1dStack([text_e], [emb_dim], n_filts, bn_flag,
-                                        n_stacks=n_stacks,
-                                        kernel_sizes=[(1, 1), (3, 3), (5, 5)],
-                                        name="enc_conv1", random_state=random_state)
+        random_state = np.random.RandomState(1442)
+        self.conv_text_obj = SequenceConv1dStack([emb_dim], n_filts,
+                                            batch_norm_flag=bn_flag,
+                                            n_stacks=n_stacks,
+                                            kernel_sizes=[(1, 1), (3, 3), (5, 5)],
+                                            name="enc_conv1",
+                                            random_state=random_state)
 
         # text_mask and mask_mask should be the same, doesn't matter which one we use
-        bitext = BiLSTMLayer([conv_text], [n_filts],
-                             enc_units,
-                             input_mask=text_mask,
-                             name="encode_bidir",
-                             init=rnn_init,
-                             random_state=random_state)
+        random_state = np.random.RandomState(1442)
+        self.bitext_layer_obj = BiLSTMLayer([n_filts],
+                                       enc_units,
+                                       name="encode_bidir",
+                                       init=rnn_init,
+                                       random_state=random_state)
+        random_state = np.random.RandomState(1442)
+        self.attn_obj = GaussianAttentionCell([prenet_units],
+                                         2 * enc_units,
+                                         dec_units,
+                                         attention_scale=1.,
+                                         step_op="softplus",
+                                         name="att",
+                                         random_state=random_state,
+                                         init=rnn_init)
+
+        random_state = np.random.RandomState(1442)
+        self.rnn1_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
+                            dec_units,
+                            random_state=random_state,
+                            name="rnn1", init=rnn_init)
+
+        random_state = np.random.RandomState(1442)
+        self.rnn2_obj = LSTMCell([prenet_units, 2 * enc_units, dec_units],
+                            dec_units,
+                            random_state=random_state,
+                            name="rnn2", init=rnn_init)
+
+        random_state = np.random.RandomState(1442)
+        self.pred_obj = Linear([dec_units], output_size,
+                          name="out_proj",
+                          random_state=random_state)
+
+    def forward(self, in_mels, in_mel_mask, out_mels, out_mel_mask, text, text_mask, mask, mask_mask, reset):
+        projmel1 = self.projmel1_obj([in_mels],
+                                 dropout_flag_prob_keep=prenet_dropout)
+        projmel2 = self.projmel2_obj([projmel1],
+                                dropout_flag_prob_keep=prenet_dropout)
+
+        text_char_e, t_c_emb = self.text_emb_obj(text)
+        text_e = text_char_e
+
+        conv_text = self.conv_text_obj([text_e])
+
+        bitext = self.bitext_layer_obj([conv_text],
+                                  input_mask=text_mask)
 
 
         def step(inp_t, inp_mask_t,
@@ -328,43 +198,29 @@ def create_graph():
                  att_w_tm1, att_k_tm1, att_h_tm1, att_c_tm1,
                  h1_tm1, c1_tm1, h2_tm1, c2_tm1):
 
-            o = GaussianAttentionCell([corr_inp_t], [prenet_units],
-                                      (att_h_tm1, att_c_tm1),
-                                      att_k_tm1,
-                                      bitext,
-                                      2 * enc_units,
-                                      dec_units,
-                                      att_w_tm1,
-                                      input_mask=inp_mask_t,
-                                      conditioning_mask=text_mask,
-                                      #attention_scale=1. / 10.,
-                                      attention_scale=1.,
-                                      step_op="softplus",
-                                      name="att",
-                                      random_state=random_state,
-                                      cell_dropout=1.,#cell_dropout,
-                                      init=rnn_init)
+            o = self.attn_obj([corr_inp_t],
+                         (att_h_tm1, att_c_tm1),
+                         att_k_tm1,
+                         bitext,
+                         att_w_tm1,
+                         input_mask=inp_mask_t,
+                         conditioning_mask=text_mask,
+                         #attention_scale=1. / 10.,
+                         cell_dropout=1.)
             att_w_t, att_k_t, att_phi_t, s = o
             att_h_t = s[0]
             att_c_t = s[1]
 
-            output, s = LSTMCell([corr_inp_t, att_w_t, att_h_t],
-                                 [prenet_units, 2 * enc_units, dec_units],
-                                 h1_tm1, c1_tm1, dec_units,
+            output, s = self.rnn1_obj([corr_inp_t, att_w_t, att_h_t],
+                                 h1_tm1, c1_tm1,
                                  input_mask=inp_mask_t,
-                                 random_state=random_state,
-                                 cell_dropout=cell_dropout,
-                                 name="rnn1", init=rnn_init)
+                                 cell_dropout=cell_dropout)
             h1_t = s[0]
             c1_t = s[1]
-
-            output, s = LSTMCell([corr_inp_t, att_w_t, h1_t],
-                                 [prenet_units, 2 * enc_units, dec_units],
-                                 h2_tm1, c2_tm1, dec_units,
+            output, s = self.rnn2_obj([corr_inp_t, att_w_t, h1_t],
+                                 h2_tm1, c2_tm1,
                                  input_mask=inp_mask_t,
-                                 random_state=random_state,
-                                 cell_dropout=cell_dropout,
-                                 name="rnn2", init=rnn_init)
+                                 cell_dropout=cell_dropout)
             h2_t = s[0]
             c2_t = s[1]
             return output, att_w_t, att_k_t, att_phi_t, att_h_t, att_c_t, h1_t, c1_t, h2_t, c2_t
@@ -372,7 +228,9 @@ def create_graph():
         r = scan(step,
                  [in_mels, in_mel_mask, projmel2],
                  [None, att_w_init, att_k_init, None, att_h_init, att_c_init,
-                  h1_init, c1_init, h2_init, c2_init])
+                 h1_init, c1_init, h2_init, c2_init])
+
+        # values are close-ish to tf but floating point variances accumulate
         output = r[0]
         att_w = r[1]
         att_k = r[2]
@@ -384,204 +242,67 @@ def create_graph():
         h2 = r[8]
         c2 = r[9]
 
-        pred = Linear([output], [dec_units], output_size, name="out_proj", random_state=random_state)
-        """
-        mix, means, lins = DiscreteMixtureOfLogistics([proj], [output_size], n_output_channels=1,
-                                                      name="dml", random_state=random_state)
-        cc = DiscreteMixtureOfLogisticsCost(mix, means, lins, out_mels, 256)
-        """
+        pred = self.pred_obj([output])
+        return pred
 
-        # correct masking
-        cc = (pred - out_mels) ** 2
-        #cc = out_mel_mask[..., None] * cc
-        #loss = tf.reduce_sum(tf.reduce_sum(cc, axis=-1)) / tf.reduce_sum(out_mel_mask)
-        loss = tf.reduce_mean(tf.reduce_sum(cc, axis=-1))
+mod = GlobalModel()
+learning_rate = 0.0001
+optimizer = torch.optim.Adam(mod.parameters(), learning_rate)
 
-        learning_rate = 0.0001
-        #steps = tf.Variable(0.)
-        #learning_rate = tf.train.exponential_decay(0.001, steps, staircase=True,
-        #                                           decay_steps=50000, decay_rate=0.5)
+mels, mel_mask, text, text_mask, mask, mask_mask, reset = train_itr.next_masked_batch()
+text = torch.FloatTensor(text)
+text_mask = torch.FloatTensor(text_mask)
+mels = torch.FloatTensor(mels)
+mel_mask = torch.FloatTensor(mel_mask)
+in_mels = mels[:-1, :, :]
+in_mel_mask = mel_mask[:-1]
+out_mels = mels[1:, :, :]
+out_mel_mask = mel_mask[1:]
 
-        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate, use_locking=True)
-        grad, var = zip(*optimizer.compute_gradients(loss))
-        grad, _ = tf.clip_by_global_norm(grad, 10.)
-        #train_step = optimizer.apply_gradients(zip(grad, var), global_step=steps)
-        train_step = optimizer.apply_gradients(zip(grad, var))
+pred = mod(in_mels, in_mel_mask, out_mels, out_mel_mask, text, text_mask, mask, mask_mask, reset)
+cc = torch.pow(pred - out_mels, 2)
+loss = cc.sum(dim=-1).mean()
+optimizer.zero_grad()
+loss.backward()
+clipping_grad_norm_(mod.parameters(), 10.)
+optimizer.step()
 
-    things_names = ["mels",
-                    "mel_mask",
-                    "in_mels",
-                    "in_mel_mask",
-                    "out_mels",
-                    "out_mel_mask",
-                    "text",
-                    "text_mask",
-                    #"mask",
-                    #"mask_mask",
-                    "bias",
-                    "cell_dropout",
-                    "prenet_dropout",
-                    "bn_flag",
-                    "pred",
-                    #"mix", "means", "lins",
-                    "att_w_init",
-                    "att_k_init",
-                    "att_h_init",
-                    "att_c_init",
-                    "h1_init",
-                    "c1_init",
-                    "h2_init",
-                    "c2_init",
-                    "att_w",
-                    "att_k",
-                    "att_phi",
-                    "att_h",
-                    "att_c",
-                    "h1",
-                    "c1",
-                    "h2",
-                    "c2",
-                    "loss",
-                    "train_step",
-                    "learning_rate"]
-    things_tf = [eval(name) for name in things_names]
-    for tn, tt in zip(things_names, things_tf):
-        graph.add_to_collection(tn, tt)
-    train_model = namedtuple('Model', things_names)(*things_tf)
-    return graph, train_model
+pred0 = pred
+cc0 = cc
+loss0 = loss
 
-g, vs = create_graph()
+mels, mel_mask, text, text_mask, mask, mask_mask, reset = train_itr.next_masked_batch()
+text = torch.FloatTensor(text)
+text_mask = torch.FloatTensor(text_mask)
+mels = torch.FloatTensor(mels)
+mel_mask = torch.FloatTensor(mel_mask)
+in_mels = mels[:-1, :, :]
+in_mel_mask = mel_mask[:-1]
+out_mels = mels[1:, :, :]
+out_mel_mask = mel_mask[1:]
 
-att_w_init = np.zeros((batch_size, 2 * enc_units))
-att_k_init = np.zeros((batch_size, window_mixtures))
-att_h_init = np.zeros((batch_size, dec_units))
-att_c_init = np.zeros((batch_size, dec_units))
-h1_init = np.zeros((batch_size, dec_units))
-c1_init = np.zeros((batch_size, dec_units))
-h2_init = np.zeros((batch_size, dec_units))
-c2_init = np.zeros((batch_size, dec_units))
 
-stateful_args = [att_w_init,
-                 att_k_init,
-                 att_h_init,
-                 att_c_init,
-                 h1_init,
-                 c1_init,
-                 h2_init,
-                 c2_init]
-step_count = 0
-def loop(sess, itr, extras, stateful_args):
-    """
-    global step_count
-    global noise_scale
-    step_count += 1
-    if step_count > 10000:
-        step_count = 0
-        if noise_scale == 2:
-           noise_scale = 1.
-        else:
-            noise_scale = noise_scale - 2.
-        if noise_scale < .5:
-            noise_scale = .5
-    """
-    mels, mel_mask, text, text_mask, mask, mask_mask, reset = itr.next_masked_batch()
-    in_m = mels[:-1]
-    in_mel_mask = mel_mask[:-1]
+pred = mod(in_mels, in_mel_mask, out_mels, out_mel_mask, text, text_mask, mask, mask_mask, reset)
+cc = torch.pow(pred - out_mels, 2)
+loss = cc.sum(dim=-1).mean()
+optimizer.zero_grad()
+loss.backward()
+clipping_grad_norm_(mod.parameters(), 10.)
+optimizer.step()
 
-    #noise_block = np.clip(random_state.randn(*in_m.shape), -6, 6)
-    #in_m = in_m + noise_scale * noise_block
+loss1 = loss
+cc1 = cc
+pred1 = pred
 
-    out_m = mels[1:]
-    out_mel_mask = mel_mask[1:]
+d0 = {}
+d0["pred"] = pred0
+d0["cc"] = cc0
+d0["loss"] = loss0
 
-    att_w_init = stateful_args[0]
-    att_k_init = stateful_args[1]
-    att_h_init = stateful_args[2]
-    att_c_init = stateful_args[3]
-    h1_init = stateful_args[4]
-    c1_init = stateful_args[5]
-    h2_init = stateful_args[6]
-    c2_init = stateful_args[7]
+d1 = {}
+d1["pred"] = pred1
+d1["cc"] = cc1
+d1["loss"] = loss1
 
-    att_w_init *= reset
-    att_k_init *= reset
-    att_h_init *= reset
-    att_c_init *= reset
-    h1_init *= reset
-    c1_init *= reset
-    h2_init *= reset
-    c2_init *= reset
+from IPython import embed; embed(); raise ValueError()
 
-    feed = {
-            vs.in_mels: in_m,
-            vs.in_mel_mask: in_mel_mask,
-            vs.out_mels: out_m,
-            vs.out_mel_mask: out_mel_mask,
-            vs.bn_flag: 0.,
-            vs.text: text,
-            vs.text_mask: text_mask,
-            #vs.mask: mask,
-            #vs.mask_mask: mask_mask,
-            vs.att_w_init: att_w_init,
-            vs.att_k_init: att_k_init,
-            vs.att_h_init: att_h_init,
-            vs.att_c_init: att_c_init,
-            vs.h1_init: h1_init,
-            vs.c1_init: c1_init,
-            vs.h2_init: h2_init,
-            vs.c2_init: c2_init}
-    outs = [vs.att_w, vs.att_k,
-            vs.att_h, vs.att_c,
-            vs.h1, vs.c1, vs.h2, vs.c2,
-            vs.att_phi,
-            vs.loss, vs.train_step]
-
-    r = sess.run(outs, feed_dict=feed)
-
-    att_w_np = r[0]
-    att_k_np = r[1]
-    att_h_np = r[2]
-    att_c_np = r[3]
-    h1_np = r[4]
-    c1_np = r[5]
-    h2_np = r[6]
-    c2_np = r[7]
-    att_phi_np = r[8]
-    from IPython import embed; embed(); raise ValueError()
-    l = r[-2]
-    _ = r[-1]
-
-    # set next inits
-    att_w_init = att_w_np[-1]
-    att_k_init = att_k_np[-1]
-    att_h_init = att_h_np[-1]
-    att_c_init = att_c_np[-1]
-    h1_init = h1_np[-1]
-    c1_init = c1_np[-1]
-    h2_init = h2_np[-1]
-    c2_init = c2_np[-1]
-
-    stateful_args = [att_w_init,
-                     att_k_init,
-                     att_h_init,
-                     att_c_init,
-                     h1_init,
-                     c1_init,
-                     h2_init,
-                     c2_init]
-    return l, None, stateful_args
-
-with tf.Session(graph=g) as sess:
-    sess.run(tf.global_variables_initializer())
-    for i in range(100):
-        loop(sess, train_itr, {}, stateful_args)
-        print(i)
-    #
-    #run_loop(sess,
-    #         loop, train_itr,
-    #         loop, train_itr,
-    #         n_steps=1000000,
-    #         n_train_steps_per=1000,
-    #         train_stateful_args=stateful_args,
-    #         n_valid_steps_per=0,
-    #         valid_stateful_args=stateful_args)

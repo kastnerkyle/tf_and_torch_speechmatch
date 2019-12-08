@@ -479,6 +479,17 @@ def scan(fn, sequences, outputs_info):
     return [torch.stack(rj) for rj in r]
 
 
+def clipping_grad_norm_(parameters, rescale):
+    # is a generator... get a static reference so the second iteration isn't empty
+    _params = [p for p in parameters]
+    grad_norm = torch.sqrt(sum([torch.sqrt(torch.pow(p.grad.data, 2).sum()) for p in _params]))
+    scaling_num = rescale
+    scaling_den = max([1.0 * rescale, grad_norm])
+    scaling = scaling_num / scaling_den
+    for p in _params:
+        p.grad.data.mul_(scaling)
+
+
 class Embedding(torch.nn.Module):
     def __init__(self,
                  n_symbols,
@@ -659,7 +670,7 @@ class Linear(torch.nn.Module):
         except NameError:
             weight = make_tensor(weight_values, dtype=dtype, device=device)
             _set_shared(name_w, weight)
-        self.weight = weight
+        self.weight = torch.nn.Parameter(weight)
         self.biases = None
 
         if biases:
@@ -673,7 +684,7 @@ class Linear(torch.nn.Module):
             except NameError:
                 biases = make_tensor(b, dtype=dtype, device=device)
                 _set_shared(name_b, biases)
-            self.biases = biases
+            self.biases = torch.nn.Parameter(biases)
 
     def forward(self,
                 list_of_inputs,
@@ -837,7 +848,7 @@ class Conv2d(torch.nn.Module):
             weight = make_tensor(weight_values, dtype=dtype, device=device)
             _set_shared(name_w, weight)
 
-        self.weight = weight
+        self.weight = torch.nn.Parameter(weight)
 
         if custom_weight_mask is not None:
             """
@@ -849,6 +860,7 @@ class Conv2d(torch.nn.Module):
             """
             raise ValueError("custom_weight_mask not yet implemented in conv")
             weight = tf.constant(custom_weight_mask) * weight
+
 
         # need to custom handle SAME and VALID
         # rip
@@ -866,7 +878,8 @@ class Conv2d(torch.nn.Module):
             except NameError:
                 biases = make_tensor(b, dtype=dtype, device=device)
                 _set_shared(name_b, biases)
-        self.biases = biases
+            self.biases = torch.nn.Parameter(biases)
+
         self.strides = strides
         self.dilation = dilation
         self.input_channels = input_channels
@@ -1201,8 +1214,8 @@ class BatchNorm2d(torch.nn.Module):
             beta = make_tensor(beta_values, dtype=dtype, device=device)
             _set_shared(name_beta, beta)
 
-        self.beta = beta
-        self.scale = scale
+        self.beta = torch.nn.Parameter(beta)
+        self.scale = torch.nn.Parameter(scale)
         self.decay = decay
         self.eps = eps
         self.dtype = dtype
